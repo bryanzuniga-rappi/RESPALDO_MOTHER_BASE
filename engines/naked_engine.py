@@ -1,0 +1,34 @@
+"""Clasificación MOV para Otacon; nombre de módulo conservado por compatibilidad.
+
+Posición: selección del residual, después de ejecutar DOI mediante Naked.
+Entrada: fila consolidada del Bulk (ROQ_INPUT / MOV_ORIGINAL).
+Salida: predicados que clasifican la fila (recomendación positiva o no).
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+import modelo_abasto as engine
+
+
+def is_naked_requirement(
+    row: dict[str, Any],
+    config: engine.Config,
+) -> bool:
+    """Identifica una recomendación natural positiva de Fountain9."""
+    original_roq = engine.to_float(
+        row.get("ROQ_INPUT", row.get("MOV_ORIGINAL", 0.0)),
+        0.0,
+    )
+    target, _ = engine.calculate_target_quantity(row, config)
+    return original_roq > 0 and target > 0
+
+
+def is_no_recommendation(
+    row: dict[str, Any],
+    config: engine.Config,
+) -> bool:
+    target, _ = engine.calculate_target_quantity(row, config)
+    return target <= 0
+
