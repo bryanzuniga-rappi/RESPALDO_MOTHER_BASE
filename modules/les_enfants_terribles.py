@@ -22,8 +22,8 @@ import html
 import io
 import math
 import csv
+import gc
 import re
-import statistics
 import shutil
 import tempfile
 import time
@@ -49,7 +49,6 @@ from reportlab.platypus import (
 )
 
 import modelo_abasto as engine
-from modules import mail_sender
 from engines.liquid_engine import (
     LIQUID_CUT,
     LIQUID_REASON,
@@ -84,6 +83,12 @@ from mother_base_theme import (
 
 APP_NAME = "Les Enfants Terribles"
 MAX_UPLOAD_MB = 500
+PLANNING_DRIVE_FOLDER_ID = "1SfvpuHo0uhZLQb8pG5HZuJFH0bJPMu1f"
+PLANNING_DRIVE_SCOPE = "https://www.googleapis.com/auth/drive"
+
+
+class PlanningDriveError(RuntimeError):
+    """Error recuperable al publicar el ZIP de planeación en Drive."""
 
 
 def configured_data_transfers_spreadsheet_id() -> str:
@@ -1152,15 +1157,17 @@ def relative_update_text(
 def inspect_database(workbook_bytes: bytes) -> dict[str, Any]:
     """Valida presencia de hojas, actualizaciones Aleph y errores IMPORTRANGE."""
     rows: list[dict[str, Any]] = []
-    formula_workbook = openpyxl.load_workbook(
-        io.BytesIO(workbook_bytes), read_only=True, data_only=False
-    )
-    value_workbook = openpyxl.load_workbook(
+    # La validación se ejecutaba con dos libros XLSX abiertos en paralelo
+    # (fórmulas + valores), duplicando el pico de memoria antes de planear.
+    # Abrimos la vista calculada y solo hacemos fallback a fórmulas si una
+    # celda de control no tiene valor cacheado.
+    workbook = openpyxl.load_workbook(
         io.BytesIO(workbook_bytes), read_only=True, data_only=True
     )
+    formula_workbook = None
     try:
         for sheet_name in REQUIRED_DATABASE_SHEETS:
-            if sheet_name not in formula_workbook.sheetnames:
+            if sheet_name not in workbook.sheetnames:
                 rows.append(
                     {
                         "HOJA": sheet_name,
@@ -1172,12 +1179,15 @@ def inspect_database(workbook_bytes: bytes) -> dict[str, Any]:
                 )
                 continue
 
-            formula_sheet = formula_workbook[sheet_name]
-            value_sheet = value_workbook[sheet_name]
+            sheet = workbook[sheet_name]
             if sheet_name in ALEPH_SHEETS:
-                value = value_sheet["C7"].value
+                value = sheet["C7"].value
                 if value is None:
-                    value = formula_sheet["C7"].value
+                    if formula_workbook is None:
+                        formula_workbook = openpyxl.load_workbook(
+                            io.BytesIO(workbook_bytes), read_only=True, data_only=False
+                        )
+                    value = formula_workbook[sheet_name]["C7"].value
                 detail, healthy = relative_update_text(
                     value,
                     max_age_hours=ALEPH_MAX_AGE_HOURS.get(sheet_name, 24.0),
@@ -1186,11 +1196,14 @@ def inspect_database(workbook_bytes: bytes) -> dict[str, Any]:
                     healthy = False
                     detail = "#REF! DETECTADO EN C7"
             elif sheet_name in MANUAL_BACKEND_SHEETS:
-                formula_value = formula_sheet["A1"].value
-                displayed_value = value_sheet["A1"].value
-                header = engine.normalize_header(
-                    displayed_value if displayed_value is not None else formula_value
-                )
+                displayed_value = sheet["A1"].value
+                if displayed_value is None:
+                    if formula_workbook is None:
+                        formula_workbook = openpyxl.load_workbook(
+                            io.BytesIO(workbook_bytes), read_only=True, data_only=False
+                        )
+                    displayed_value = formula_workbook[sheet_name]["A1"].value
+                header = engine.normalize_header(displayed_value)
                 healthy = header == "WAREHOUSE_ID"
                 detail = (
                     "BLOQUEO BACKEND DISPONIBLE"
@@ -1198,12 +1211,8 @@ def inspect_database(workbook_bytes: bytes) -> dict[str, Any]:
                     else "A1 DEBE SER WAREHOUSE_ID"
                 )
             else:
-                formula_value = formula_sheet["A1"].value
-                displayed_value = value_sheet["A1"].value
-                healthy = not (
-                    contains_ref_error(formula_value)
-                    or contains_ref_error(displayed_value)
-                )
+                displayed_value = sheet["A1"].value
+                healthy = not contains_ref_error(displayed_value)
                 detail = "SIN #REF!" if healthy else "#REF! DETECTADO"
 
             rows.append(
@@ -1216,8 +1225,9 @@ def inspect_database(workbook_bytes: bytes) -> dict[str, Any]:
                 }
             )
     finally:
-        formula_workbook.close()
-        value_workbook.close()
+        workbook.close()
+        if formula_workbook is not None:
+            formula_workbook.close()
 
     healthy_count = sum(row["ESTADO"] == "OK" for row in rows)
     return {
@@ -1306,12 +1316,16 @@ COPERNICO_REQUIRED_WAREHOUSES: frozenset[int] = frozenset({444, 831, 856})
 COPERNICO_BODEGA_HEADER_ALIASES = {"BODEGA", "WAREHOUSE ID", "WAREHOUSE_ID"}
 
 
-def copernico_warehouses_from_text(text: str) -> set[int]:
-    """Bodegas de la columna Bodega de un CSV de COPÉRNICO ya decodificado."""
+def copernico_warehouses_from_stream(handle) -> set[int]:
+    """Bodegas de COPÉRNICO sin materializar el CSV completo en memoria."""
     warehouses: set[int] = set()
     # Mismo formato fijo que el lector de COPÉRNICO del motor (sin Sniffer).
-    dialect = engine.copernico_csv_dialect(text.split("\n", 1)[0])
-    reader = csv.DictReader(io.StringIO(text), dialect=dialect)
+    header_line = handle.readline()
+    if not header_line:
+        return warehouses
+    dialect = engine.copernico_csv_dialect(header_line)
+    handle.seek(0)
+    reader = csv.DictReader(handle, dialect=dialect)
     if not reader.fieldnames:
         return warehouses
     bodega_field = next(
@@ -1331,26 +1345,48 @@ def copernico_warehouses_from_text(text: str) -> set[int]:
     return warehouses
 
 
+def copernico_warehouses_from_path(path: Path) -> set[int]:
+    """Versión en streaming para los archivos ya persistidos de la corrida."""
+    with path.open("r", encoding="utf-8-sig", errors="replace", newline="") as handle:
+        return copernico_warehouses_from_stream(handle)
+
+
 def detect_copernico_warehouses(uploaded_files) -> set[int]:
-    """Lee la columna Bodega de cada archivo COPÉRNICO cargado, sin guardar nada en
-    disco, para saber qué warehouses cubre antes de validar la corrida.
-    """
+    """Lee Bodega en streaming para validar los orígenes requeridos."""
     warehouses: set[int] = set()
     for uploaded_file in uploaded_files or ():
+        text_handle = None
         try:
             uploaded_file.seek(0)
-            raw_bytes = uploaded_file.getvalue()
+            # UploadedFile de Streamlit es un stream. El fallback conserva la
+            # compatibilidad con dobles ligeros de prueba que sólo exponen
+            # getvalue(), sin afectar los archivos reales.
+            raw_handle = (
+                uploaded_file
+                if (
+                    callable(getattr(uploaded_file, "read", None))
+                    and callable(getattr(uploaded_file, "readable", None))
+                )
+                else io.BytesIO(uploaded_file.getvalue())
+            )
+            text_handle = io.TextIOWrapper(
+                raw_handle, encoding="utf-8-sig", errors="replace", newline=""
+            )
+            warehouses |= copernico_warehouses_from_stream(text_handle)
         except Exception:
             continue
-        try:
-            text = raw_bytes.decode("utf-8-sig", errors="replace")
-        except Exception:
-            continue
-        warehouses |= copernico_warehouses_from_text(text)
-        try:
-            uploaded_file.seek(0)
-        except Exception:
-            pass
+        finally:
+            # detach evita que TextIOWrapper cierre el UploadedFile de
+            # Streamlit; éste se reutiliza después para copiarlo a disco.
+            if text_handle is not None:
+                try:
+                    text_handle.detach()
+                except Exception:
+                    pass
+            try:
+                uploaded_file.seek(0)
+            except Exception:
+                pass
     return warehouses
 
 
@@ -1374,9 +1410,11 @@ def consolidate_plan_files(
     source_row_count = 0
     source_counts: Counter[str] = Counter()
     fountain9_instructions: dict[tuple[int | None, int, int], int] = defaultdict(int)
-    # Para la moda de Duration/Lead Time por tienda (ver más abajo).
-    duration_values_by_store: dict[int, list[float]] = defaultdict(list)
-    lead_time_values_by_store: dict[int, list[float]] = defaultdict(list)
+    # Una moda no requiere guardar cada observación. Counter conserva el
+    # desempate por primera aparición y evita listas proporcionales a todas
+    # las filas de Fountain9.
+    duration_counts_by_store: dict[int, Counter[float]] = defaultdict(Counter)
+    lead_time_counts_by_store: dict[int, Counter[float]] = defaultdict(Counter)
 
     for path in plan_paths:
         with path.open(
@@ -1492,11 +1530,11 @@ def consolidate_plan_files(
                 if duration_field is not None:
                     duration_value = engine.to_float(raw.get(duration_field, ""))
                     if duration_value > 0:
-                        duration_values_by_store[destination].append(duration_value)
+                        duration_counts_by_store[destination][duration_value] += 1
                 if lead_time_field is not None:
                     lead_time_value = engine.to_float(raw.get(lead_time_field, ""))
                     if lead_time_value > 0:
-                        lead_time_values_by_store[destination].append(lead_time_value)
+                        lead_time_counts_by_store[destination][lead_time_value] += 1
                 sku_field = required_lookup["SKU ID"]
                 sku = engine.to_id(
                     raw.get(sku_field, ""),
@@ -1588,47 +1626,11 @@ def consolidate_plan_files(
     if not consolidated:
         raise ValueError("Los archivos cargados no contienen requerimientos válidos.")
 
-    output_rows: list[dict[str, Any]] = []
+    # El CSV canónico sigue siendo un artefacto de la corrida, pero se escribe
+    # en streaming. Así no coexistirá una segunda lista completa de filas con
+    # el diccionario consolidado.
+    plan_rows: list[dict[str, Any]] = []
     net_transfer_hardcodes = 0
-    for key, record in consolidated.items():
-        destination, sku = key
-        destination_stock = max(
-            float(catalogs.stock_base.get((destination, sku), 0.0)),
-            0.0,
-        )
-        demand = record["PREDICTED_DEMAND"]
-        opening = record["PREDICTED_OPENING_INVENTORY"]
-        record["ROQ_INPUT"] = max(record["ROQ_INPUT"], record["FOUNTAIN9_ALLOCATION"] or 0)
-        roq_input = record["ROQ_INPUT"]
-        net_transfer = record["NET_INTER_STORE_TRANSFERS"]
-        zero_total_rule = (
-            math.isclose(demand, 0.0, abs_tol=1e-9)
-            and math.isclose(opening, 0.0, abs_tol=1e-9)
-        )
-        deficit_rule = opening < demand
-        net_transfer_rule = (
-            net_transfer_rule_enabled
-            and roq_input <= 0
-            and net_transfer <= net_transfer_max
-            and destination_stock < destination_stock_below
-            and not zero_total_rule
-            and not deficit_rule
-        )
-        record["NET_TRANSFER_HARDCODE_3"] = net_transfer_rule
-        effective_roq = 3.0 if net_transfer_rule else roq_input
-        net_transfer_hardcodes += int(net_transfer_rule)
-        output_rows.append(
-            {
-                "Warehouseid": destination,
-                "SKU ID": sku,
-                "Current Inventory": destination_stock,
-                "Predicted Demand for selected duration": demand,
-                "Predicted Opening Inventory": opening,
-                "Replenishment Quantity for Plan Duration (MOV)": effective_roq,
-                "Net Inter-Store Transfers": net_transfer,
-            }
-        )
-
     canonical_columns = [
         "Warehouseid",
         "SKU ID",
@@ -1638,26 +1640,65 @@ def consolidate_plan_files(
         "Replenishment Quantity for Plan Duration (MOV)",
         "Net Inter-Store Transfers",
     ]
-    output_rows.sort(key=lambda row: (row["Warehouseid"], row["SKU ID"]))
-    engine.write_csv(output_path, output_rows, canonical_columns)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", encoding="utf-8-sig", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=canonical_columns)
+        writer.writeheader()
+        for input_row, (key, record) in enumerate(sorted(consolidated.items()), start=2):
+            destination, sku = key
+            destination_stock = max(float(catalogs.stock_base.get((destination, sku), 0.0)), 0.0)
+            demand = record["PREDICTED_DEMAND"]
+            opening = record["PREDICTED_OPENING_INVENTORY"]
+            record["ROQ_INPUT"] = max(record["ROQ_INPUT"], record["FOUNTAIN9_ALLOCATION"] or 0)
+            roq_input = record["ROQ_INPUT"]
+            net_transfer = record["NET_INTER_STORE_TRANSFERS"]
+            zero_total_rule = math.isclose(demand, 0.0, abs_tol=1e-9) and math.isclose(opening, 0.0, abs_tol=1e-9)
+            net_transfer_rule = (
+                net_transfer_rule_enabled and roq_input <= 0
+                and net_transfer <= net_transfer_max
+                and destination_stock < destination_stock_below
+                and not zero_total_rule and not (opening < demand)
+            )
+            record["NET_TRANSFER_HARDCODE_3"] = net_transfer_rule
+            effective_roq = 3.0 if net_transfer_rule else roq_input
+            net_transfer_hardcodes += int(net_transfer_rule)
+            writer.writerow({
+                "Warehouseid": destination, "SKU ID": sku,
+                "Current Inventory": destination_stock,
+                "Predicted Demand for selected duration": demand,
+                "Predicted Opening Inventory": opening,
+                "Replenishment Quantity for Plan Duration (MOV)": effective_roq,
+                "Net Inter-Store Transfers": net_transfer,
+            })
+            plan_rows.append({
+                "INPUT_ROW": input_row,
+                "WAREHOUSE_DESTINATION": destination,
+                "RETAIL_ID": sku,
+                "SKU_NAME": "", "CSV_WAREHOUSE_NAME": "",
+                "CURRENT_INVENTORY": destination_stock,
+                "PREDICTED_DEMAND": demand,
+                "PREDICTED_OPENING_INVENTORY": opening,
+                "MOV_ORIGINAL": effective_roq,
+                "INPUT_DUPLICATE_COUNT": 1,
+                "INPUT_ROWS_MERGED": str(input_row),
+                "INPUT_DUPLICATE_CONFLICT": False,
+            })
 
     unique_count = len(consolidated)
     duplicated_keys = sum(
         int(record["SOURCE_ROWS"] > 1) for record in consolidated.values()
     )
-    # Moda de Duration/Lead Time por tienda — una sola vez, sobre TODAS las
-    # filas de esa tienda en TODOS los archivos cargados (no por archivo).
-    # statistics.mode() toma el primer valor más frecuente en caso de
-    # empate (determinístico, sin lanzar excepción).
+    # Counter conserva orden de inserción, por lo que max() mantiene el mismo
+    # desempate de primera aparición que tenía statistics.mode().
     duration_mode_by_store: dict[int, float] = {
-        store: statistics.mode(values)
-        for store, values in duration_values_by_store.items()
-        if values
+        store: max(counts, key=counts.get)
+        for store, counts in duration_counts_by_store.items()
+        if counts
     }
     lead_time_mode_by_store: dict[int, float] = {
-        store: statistics.mode(values)
-        for store, values in lead_time_values_by_store.items()
-        if values
+        store: max(counts, key=counts.get)
+        for store, counts in lead_time_counts_by_store.items()
+        if counts
     }
     summary = {
         "files": len(plan_paths),
@@ -1691,6 +1732,16 @@ def consolidate_plan_files(
                 ),
             )
         ],
+        # execute_planning lo extrae enseguida con pop(), evitando conservar
+        # una segunda representación de la planeación en el resumen final.
+        "_plan_read": engine.PlanReadResult(
+            rows=plan_rows,
+            warnings=[],
+            input_row_count=source_row_count,
+            duplicate_row_count=max(source_row_count - unique_count, 0),
+            duplicate_key_count=duplicated_keys,
+            conflicting_duplicate_key_count=0,
+        ),
     }
     return output_path, consolidated, summary
 
@@ -1731,7 +1782,13 @@ def build_naked_fountain9_rows(
     instructions: list[dict[str, Any]],
     plan_rows: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    """Arma la cola estricta de Naked desde Allocation (DOI Based)."""
+    """Arma la cola Naked desde Allocation (DOI Based).
+
+    Fountain9 define la necesidad (destino, SKU y cantidad). Naked consume el
+    inventario desde todos los orígenes del CODEC, respetando exactamente el
+    orden elegido por el usuario; la fuente original de Fountain9 se conserva
+    exclusivamente para auditoría.
+    """
     by_key = {
         (int(row["WAREHOUSE_DESTINATION"]), int(row["RETAIL_ID"])): row
         for row in plan_rows
@@ -1749,6 +1806,7 @@ def build_naked_fountain9_rows(
                 "FORCED_SOURCE": instruction.get("WAREHOUSE_SOURCE"),
                 "FORCED_RULE": "FOUNTAIN9_DOI",
                 "ALLOW_PARTIAL": True,
+                "SOURCE_PRIORITY_CODEC": True,
             }
         )
         naked_rows.append(base)
@@ -6788,6 +6846,12 @@ def execute_planning(
     venom_manual_skus_by_origin: dict[int, set[int]] | None = None,
     venom_only_manual_skus: bool = False,
 ) -> dict[str, Any]:
+    # El resultado anterior puede contener cientos de miles de diccionarios y
+    # permanecer en session_state mientras se construye la siguiente corrida.
+    # Liberarlo antes de abrir el XLSX evita que dos planeaciones convivan en
+    # memoria durante el pico de carga.
+    st.session_state.pop("last_run", None)
+    gc.collect()
     clear_previous_workspace()
     workspace = Path(tempfile.mkdtemp(prefix="transfer_planner_"))
     st.session_state["last_workspace"] = str(workspace)
@@ -6831,6 +6895,9 @@ def execute_planning(
         save_uploaded_file(uploaded_plan, plan_path)
         plan_paths.append(plan_path)
     save_database(database_bytes, data_path)
+    # El archivo ya está persistido; no mantengas otra referencia local al
+    # XLSX comprimido mientras openpyxl construye los catálogos.
+    del database_bytes
 
     config = engine.Config(
         origin_warehouses=origins,
@@ -6957,7 +7024,9 @@ def execute_planning(
                 destination_stock_below=destination_stock_below,
             )
         )
-        plan_read = engine.read_plan_csv(plan_path, config)
+        # Ya se construyó al escribir el canónico; releer el CSV completo
+        # duplicaba el pico de memoria sin cambiar reglas ni resultados.
+        plan_read = consolidation_summary.pop("_plan_read")
         enrich_consolidated_plan_read(
             plan_read,
             consolidated_input,
@@ -8127,9 +8196,7 @@ def execute_planning(
             {
                 "path": str(path),
                 "warehouses": sorted(
-                    copernico_warehouses_from_text(
-                        path.read_text(encoding="utf-8-sig", errors="replace")
-                    )
+                    copernico_warehouses_from_path(path)
                 ),
             }
             for path in copernico_paths
@@ -9225,35 +9292,141 @@ def render_engine_header(
     render_kpi_cards(cards, columns_count=4)
 
 
-def render_mail_section(run: dict[str, Any]) -> None:
-    """Sube el paquete ZIP de la corrida a la carpeta operativa de Drive."""
+def _planning_drive_secret(name: str) -> str:
+    """Lee un secreto simple sin depender de que Streamlit esté inicializado."""
+    try:
+        value = st.secrets.get(name, "")
+    except Exception:
+        return ""
+    return str(value or "").strip()
+
+
+def _planning_drive_service_account_info() -> dict[str, Any]:
+    """Obtiene la cuenta de servicio que ya tenía acceso a la carpeta operativa."""
+    try:
+        info = st.secrets["gcp_service_account"]
+    except Exception as error:
+        raise PlanningDriveError(
+            "Falta [gcp_service_account] en Secrets para subir el ZIP a Drive."
+        ) from error
+    try:
+        return dict(info)
+    except (TypeError, ValueError) as error:
+        raise PlanningDriveError(
+            "[gcp_service_account] no tiene un formato válido para Drive."
+        ) from error
+
+
+def _build_planning_drive_service() -> Any:
+    """Crea el cliente de Drive de Les Enfants Terribles, sin usar Militaires."""
+    try:
+        from google.oauth2 import service_account
+        from googleapiclient.discovery import build as build_drive_service
+
+        credentials = service_account.Credentials.from_service_account_info(
+            _planning_drive_service_account_info(),
+            scopes=[PLANNING_DRIVE_SCOPE],
+        )
+        impersonate_email = (
+            _planning_drive_secret("PLANNING_DRIVE_IMPERSONATE_EMAIL")
+            or _planning_drive_secret("DATA_DASHBOARD_IMPERSONATE_EMAIL")
+        )
+        if impersonate_email:
+            credentials = credentials.with_subject(impersonate_email)
+        return build_drive_service(
+            "drive", "v3", credentials=credentials, cache_discovery=False
+        )
+    except PlanningDriveError:
+        raise
+    except Exception as error:
+        raise PlanningDriveError(
+            f"No se pudieron preparar las credenciales de Drive: {error}"
+        ) from error
+
+
+def planning_drive_package_name(run: dict[str, Any]) -> str:
+    """Nombre operativo del ZIP, estable para una corrida y sus orígenes."""
+    origins: list[str] = []
+    for origin in run.get("origins", []):
+        try:
+            origins.append(str(int(origin)))
+        except (TypeError, ValueError):
+            if str(origin).strip():
+                origins.append(str(origin).strip())
+    raw_date = str(run.get("run_date") or "").strip()
+    try:
+        label = date.fromisoformat(raw_date).strftime("%d-%m-%Y")
+    except ValueError:
+        match = re.search(r"(\d{2}-\d{2}-\d{4})", Path(str(run.get("zip", ""))).name)
+        label = (
+            match.group(1)
+            if match
+            else datetime.now(ZoneInfo("America/Mexico_City")).strftime("%d-%m-%Y")
+        )
+    return f"TR_{'_'.join(origins) or 'SIN_ORIGEN'}_{label}.zip"
+
+
+def upload_planning_zip_to_drive(
+    run: dict[str, Any], *, service: Any | None = None, media_upload_factory: Any | None = None
+) -> str:
+    """Publica el ZIP ya generado; evita duplicarlo en memoria antes de subirlo."""
+    zip_path = Path(str(run.get("zip") or ""))
+    if not zip_path.is_file() or zip_path.stat().st_size == 0:
+        raise PlanningDriveError("La corrida no tiene un ZIP válido para subir a Drive.")
+    try:
+        if media_upload_factory is None:
+            from googleapiclient.http import MediaFileUpload
+
+            media_upload_factory = MediaFileUpload
+        drive_service = service or _build_planning_drive_service()
+        response = drive_service.files().create(
+            body={
+                "name": planning_drive_package_name(run),
+                "parents": [PLANNING_DRIVE_FOLDER_ID],
+                "mimeType": "application/zip",
+            },
+            media_body=media_upload_factory(
+                str(zip_path), mimetype="application/zip", resumable=True
+            ),
+            supportsAllDrives=True,
+            fields="id,name,webViewLink",
+        ).execute()
+    except PlanningDriveError:
+        raise
+    except Exception as error:
+        raise PlanningDriveError(f"No se pudo subir el ZIP a Drive: {error}") from error
+    return str(
+        response.get("webViewLink") or response.get("id") or planning_drive_package_name(run)
+    )
+
+
+def render_planning_drive_section(run: dict[str, Any]) -> None:
+    """Sube el paquete ZIP de la corrida a Drive desde Les Enfants Terribles."""
     st.markdown('<span class="section-label">SUBIR A DRIVE</span>', unsafe_allow_html=True)
     if run.get("simulation"):
         st.caption("Modo simulación: la corrida no generó archivos que subir.")
         return
-    st.caption("El paquete se guardará en Drive como " + mail_sender.drive_package_name(run) + ".")
+    st.caption("El paquete se guardará en Drive como " + planning_drive_package_name(run) + ".")
     if st.button(
         "Subir ZIP a Drive",
-        key="mb_mail_send",
+        key="mb_planning_drive_upload",
     ):
         with st.spinner("Subiendo el ZIP a Drive…"):
             try:
-                drive_link = mail_sender.upload_run_package_to_drive(run)
-            except mail_sender.MailError as error:
+                drive_link = upload_planning_zip_to_drive(run)
+            except PlanningDriveError as error:
                 st.error(str(error))
             except Exception as error:  # nunca debe tumbar la pantalla de resultados
                 st.error(f"No se pudo subir el ZIP a Drive: {error}")
             else:
-                st.session_state["mb_mail_last"] = {
+                st.session_state["mb_planning_drive_last"] = {
                     "run": str(run.get("zip")),
                     "drive_link": drive_link,
-                    "filename": mail_sender.drive_package_name(run),
+                    "filename": planning_drive_package_name(run),
                 }
-    last = st.session_state.get("mb_mail_last")
+    last = st.session_state.get("mb_planning_drive_last")
     if last and last.get("run") == str(run.get("zip")):
-        st.success(
-            "ZIP subido a Drive. Apps Script enviará la notificación."
-        )
+        st.success("ZIP subido a Drive.")
         st.markdown(f"[Abrir archivo en Drive]({last['drive_link']})")
 
 
@@ -9471,7 +9644,7 @@ def render_results(run: dict[str, Any]) -> None:
         columns_count=3,
     )
 
-    render_mail_section(run)
+    render_planning_drive_section(run)
 
     st.markdown(
         '<div class="result-title">CIUDADES + TIENDAS ATENDIDAS.</div>',
@@ -11316,13 +11489,17 @@ def render() -> None:
             "nunca lo exceden."
         )
 
+    # Big Boss inicia con toda la secuencia operativa activa, excepto Venom.
+    # Raiden conserva su configuración restringida y los bloqueos explícitos
+    # de los engines que no puede ejecutar más abajo.
+    big_boss_engine_default = not is_raiden
     st.session_state.setdefault("mb_engine_naked_enabled", True)
     st.session_state.setdefault("mb_engine_otacon_enabled", True)
-    st.session_state.setdefault("mb_engine_solidus_enabled", True)
-    st.session_state.setdefault("mb_engine_shalashaska_enabled", False)
-    st.session_state.setdefault("mb_engine_liquid_enabled", False)
+    st.session_state.setdefault("mb_engine_solidus_enabled", big_boss_engine_default)
+    st.session_state.setdefault("mb_engine_shalashaska_enabled", big_boss_engine_default)
+    st.session_state.setdefault("mb_engine_liquid_enabled", big_boss_engine_default)
     st.session_state.setdefault("mb_engine_venom_enabled", False)
-    st.session_state.setdefault("mb_engine_kazuhira_enabled", False)
+    st.session_state.setdefault("mb_engine_kazuhira_enabled", big_boss_engine_default)
     st.session_state.setdefault("mb_kazuhira_ignore_task_budget", False)
     st.session_state.setdefault("mb_kazuhira_ignore_store_capacity", False)
     st.session_state.setdefault("mb_kazuhira_swa_priority", False)
