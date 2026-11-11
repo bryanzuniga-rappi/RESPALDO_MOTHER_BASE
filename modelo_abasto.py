@@ -686,6 +686,13 @@ class Catalogs:
     # SKUs de la hoja BLOQUEOS (columna PRODUCT_ID) que nunca se envían a
     # ningún lugar, mantenidos directamente por negocio en DATA_TRANSFERS.
     globally_blocked_skus: set[int] = field(default_factory=set)
+    # FARMA bloquea únicamente una combinación destino-SKU. La hoja viene de
+    # IMPORTRANGE y puede no estar disponible temporalmente (#REF! en A2).
+    farma_block_pairs: set[tuple[int, int]] = field(default_factory=set)
+    # PILOTO contiene tiendas cuyo máximo absoluto es la recomendación de
+    # Fountain9. Naked sí puede ejecutar esa recomendación; ningún engine
+    # posterior puede generar volumen adicional para estos destinos.
+    pilot_store_ids: set[int] = field(default_factory=set)
     # Catálogo maestro de producto (hoja DATA), por SYNC_ID -> nombre y
     # categoría.
     product_catalog: dict[int, dict[str, str]] = field(default_factory=dict)
@@ -740,6 +747,27 @@ def load_catalogs(
             for row in iter_sheet_records(workbook, "BLOQUEOS", ["PRODUCT_ID"])
         }
         globally_blocked_skus.discard(None)
+
+        # FARMA tiene encabezados manuales en la fila 1. La disponibilidad del
+        # IMPORTRANGE se valida exclusivamente en A2: A1 nunca debe usarse
+        # como señal de #REF! porque siempre contiene WAREHOUSE_ID.
+        farma_block_pairs: set[tuple[int, int]] = set()
+        if "FARMA" in workbook.sheetnames:
+            farma_a2 = workbook["FARMA"].cell(row=2, column=1).value
+            if clean_text(farma_a2).upper() == "#REF!":
+                warnings.append(
+                    "FARMA no se aplicó: el IMPORTRANGE tiene #REF! en FARMA!A2."
+                )
+            else:
+                for row in iter_sheet_records(
+                    workbook, "FARMA", ["WAREHOUSE_ID", "PRODUCT_ID"]
+                ):
+                    destination = to_id(
+                        row["WAREHOUSE_ID"], "FARMA.WAREHOUSE_ID", True
+                    )
+                    sku = to_id(row["PRODUCT_ID"], "FARMA.PRODUCT_ID", True)
+                    if destination is not None and sku is not None:
+                        farma_block_pairs.add((destination, sku))
 
         route_cost_blocks: set[tuple[int, int]] = set()
         for row in iter_sheet_records(
@@ -1063,6 +1091,37 @@ def load_catalogs(
             }
             put_unique(stores, warehouse, value, warnings, "TIENDA", "error")
 
+        # PILOTO es deliberadamente una lista de una sola columna. Se acepta
+        # WAREHOUSE_ID (formato operativo esperado) y, como respaldo, el
+        # nombre de tienda para que una edición manual no abra la puerta a un
+        # envío equivocado. Valores desconocidos quedan advertidos y no se
+        # aplican como piloto.
+        pilot_store_ids: set[int] = set()
+        if "PILOTO" in workbook.sheetnames:
+            pilot_sheet = workbook["PILOTO"]
+            stores_by_name = {
+                normalize_header(info.get("warehouse_name", "")): warehouse
+                for warehouse, info in stores.items()
+                if normalize_header(info.get("warehouse_name", ""))
+            }
+            for row_number, values in enumerate(
+                pilot_sheet.iter_rows(min_row=2, max_col=1, values_only=True),
+                start=2,
+            ):
+                raw_value = values[0] if values else None
+                if not clean_text(raw_value):
+                    continue
+                try:
+                    destination = to_id(raw_value, f"PILOTO fila {row_number}", True)
+                except ValueError:
+                    destination = stores_by_name.get(normalize_header(raw_value))
+                if destination is None or destination not in stores:
+                    warnings.append(
+                        f"PILOTO fila {row_number}: tienda {raw_value!r} no existe en TIENDA; se ignoró."
+                    )
+                    continue
+                pilot_store_ids.add(destination)
+
         storage: dict[int, str] = {}
         for row in iter_sheet_records(
             workbook,
@@ -1199,6 +1258,8 @@ def load_catalogs(
         run_weekday_norm=run_weekday_norm,
         copernico_unusable_by_reason=copernico_unusable_by_reason,
         globally_blocked_skus=globally_blocked_skus,
+        farma_block_pairs=farma_block_pairs,
+        pilot_store_ids=pilot_store_ids,
         product_catalog=product_catalog,
         swa_potential_gain=swa_potential_gain,
         incoming_stock=dict(incoming_stock),
@@ -2735,7 +2796,25 @@ def write_planning_report(
             ("TAREAS_GENERADAS", result.tasks_used),
             ("MAX_TASKS", result.max_tasks),
             ("ADVERTENCIAS_DATOS", len(result.warnings)),
+            (
+                "CATALOGO_COMBINACIONES_LEIDAS",
+                int(getattr(result, "catalog_universe_count", 0) or 0),
+            ),
+            (
+                "CATALOGO_SANO_SIN_ENVIO",
+                int(getattr(result, "catalog_healthy_count", 0) or 0),
+            ),
         ]
+        catalog_integrity = getattr(result, "catalog_integrity", {}) or {}
+        metrics.extend(
+            [
+                ("CATALOGO_FILAS_LEIDAS", int(catalog_integrity.get("catalog_rows_read", 0) or 0)),
+                ("CATALOGO_FILAS_VALIDAS", int(catalog_integrity.get("catalog_rows_valid", 0) or 0)),
+                ("CATALOGO_FILAS_INVALIDAS", int(catalog_integrity.get("catalog_rows_invalid", 0) or 0)),
+                ("CATALOGO_DUPLICADOS_CONSOLIDADOS", int(catalog_integrity.get("catalog_duplicate_pairs", 0) or 0)),
+                ("CATALOGO_COMBINACIONES_UNICAS", int(catalog_integrity.get("catalog_unique_pairs", 0) or 0)),
+            ]
+        )
 
         summary = workbook.add_worksheet("RESUMEN")
         summary.hide_gridlines(2)
@@ -2823,6 +2902,28 @@ def write_planning_report(
                     ),
                 },
             )
+
+        # Las combinaciones sanas de CATALOGO se generan en streaming por el
+        # pipeline. Antes quedaban sólo como CSV dentro del ZIP, por lo que
+        # parecían "desaparecer" del reporte. Se incorporan como una pestaña
+        # ligera y filtrable sin añadirlas a base_rows ni duplicar memoria.
+        healthy_path_raw = getattr(result, "catalog_healthy_path", None)
+        healthy_path = Path(healthy_path_raw) if healthy_path_raw else None
+        if healthy_path and healthy_path.exists():
+            healthy = workbook.add_worksheet("CATALOGO_SANO")
+            healthy.hide_gridlines(2)
+            with healthy_path.open("r", encoding="utf-8-sig", newline="") as handle:
+                reader = csv.DictReader(handle)
+                headers = list(reader.fieldnames or [])
+                if headers:
+                    write_rectangular_sheet(
+                        workbook,
+                        healthy,
+                        headers,
+                        reader,
+                        header_format,
+                        boolean_format,
+                    )
 
         detail = workbook.add_worksheet("DETALLE_ASIGNACION")
         detail.hide_gridlines(2)
