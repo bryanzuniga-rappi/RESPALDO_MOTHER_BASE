@@ -110,26 +110,60 @@ ORIGIN_WAREHOUSES = {
     856: "CEDIS - LOCAL MTY",
     49: "NODO ALTAVISTA",
 }
-CHEDRAUI_PRIORITY_ORIGINS: tuple[int, ...] = (831, 834)
-
-
 def effective_origin_order(
     origins: Iterable[int],
     prioritize_chedraui_origins: bool = False,
+    chedraui_origins: Iterable[int] = (),
 ) -> tuple[int, ...]:
     """Devuelve el orden global que consumen todos los engines.
 
-    Con prioridad Chedraui activa, 831 y 834 se fuerzan al frente incluso si
-    no se marcaron en el selector. El resto conserva exactamente el orden de
-    CODEC y se eliminan duplicados para no evaluar un origen dos veces.
+    Con prioridad Chedraui activa, adelanta exclusivamente los orígenes que
+    están tanto en CODEC como en CEDIS_CHEDRAUI. El resto conserva exactamente
+    el orden de CODEC y se eliminan duplicados para no evaluar un origen dos
+    veces. Nunca agrega un origen que no se seleccionó en CODEC.
     """
     selected = tuple(dict.fromkeys(int(origin) for origin in origins))
     if not prioritize_chedraui_origins:
         return selected
+    chedraui_set = {int(origin) for origin in chedraui_origins}
+    prioritized = tuple(origin for origin in selected if origin in chedraui_set)
     return (
-        *CHEDRAUI_PRIORITY_ORIGINS,
-        *(origin for origin in selected if origin not in CHEDRAUI_PRIORITY_ORIGINS),
+        *prioritized,
+        *(origin for origin in selected if origin not in chedraui_set),
     )
+
+
+def configured_chedraui_origins_from_sheet(sheet) -> tuple[int, ...]:
+    """Extrae CEDIS_CHEDRAUI desde un workbook que ya está abierto."""
+    if engine.normalize_header(sheet["A1"].value) != "WAREHOUSE_ID":
+        raise ValueError(
+            "CEDIS_CHEDRAUI!A1 debe contener el encabezado WAREHOUSE_ID."
+        )
+    configured: list[int] = []
+    for row_number, (value,) in enumerate(
+        sheet.iter_rows(min_row=2, max_col=1, values_only=True), start=2
+    ):
+        if not engine.clean_text(value):
+            continue
+        warehouse = engine.to_id(value, f"CEDIS_CHEDRAUI fila {row_number}", True)
+        if warehouse is not None and warehouse not in configured:
+            configured.append(warehouse)
+    return tuple(configured)
+
+
+def configured_chedraui_origins(workbook_bytes: bytes | None) -> tuple[int, ...]:
+    """Fallback para ejecuciones directas fuera del recurso cacheado."""
+    if not workbook_bytes:
+        return ()
+    workbook = openpyxl.load_workbook(
+        io.BytesIO(workbook_bytes), read_only=True, data_only=True
+    )
+    try:
+        if "CEDIS_CHEDRAUI" not in workbook.sheetnames:
+            return ()
+        return configured_chedraui_origins_from_sheet(workbook["CEDIS_CHEDRAUI"])
+    finally:
+        workbook.close()
 
 ALEPH_SHEETS = {
     "CATALOGO",
@@ -145,7 +179,7 @@ ALEPH_SHEETS = {
     "FARMA",
 }
 
-MANUAL_BACKEND_SHEETS = {"TIENDAS_CERRADAS", "PILOTO"}
+MANUAL_BACKEND_SHEETS = {"TIENDAS_CERRADAS", "PILOTO", "CEDIS_CHEDRAUI"}
 
 REQUIRED_DATABASE_SHEETS = (
     "TIENDAS_CERRADAS",
@@ -160,6 +194,7 @@ REQUIRED_DATABASE_SHEETS = (
     "CAP_RECIBO",
     "FARMA",
     "PILOTO",
+    "CEDIS_CHEDRAUI",
     "CATALOGO",
     "KVI",
     "NO_DISPONIBLE",
@@ -231,6 +266,11 @@ SHEET_DESCRIPTIONS = {
         "Fountain9/Naked. Otacon, Solidus, Shalashaska, Liquid, Venom, "
         "Kazuhira e Insumos no pueden agregar volumen. Una tienda por fila "
         "en la columna WAREHOUSE_ID."
+    ),
+    "CEDIS_CHEDRAUI": (
+        "Lista manual de warehouses origen que pertenecen a Chedraui. Cuando "
+        "se activa la prioridad de inventario Chedraui, sólo los orígenes de "
+        "esta lista que también estén seleccionados en CODEC pasan al frente."
     ),
     "CATALOGO": (
         "Catálogo de surtido por tienda y producto con su ADU. Se utiliza para "
@@ -1324,6 +1364,7 @@ def inspect_database(
     rows: list[dict[str, Any]] = []
     city_labels: dict[str, str] = {}
     store_labels: dict[int, str] = {}
+    chedraui_origins: tuple[int, ...] = ()
     # La validación se ejecutaba con dos libros XLSX abiertos en paralelo
     # (fórmulas + valores), duplicando el pico de memoria antes de planear.
     # Abrimos la vista calculada y solo hacemos fallback a fórmulas si una
@@ -1427,6 +1468,18 @@ def inspect_database(
                 # El estado de la base ya marcará la fuente inválida. No se
                 # pierde la pantalla completa sólo por no poder poblar filtros.
                 pass
+        if include_locations and "CEDIS_CHEDRAUI" in workbook.sheetnames:
+            try:
+                # El libro ya está abierto para validar la base. Extraer esta
+                # lista pequeña aquí evita reabrir el XLSX completo en cada
+                # rerun sólo para renderizar CODEC.
+                chedraui_origins = configured_chedraui_origins_from_sheet(
+                    workbook["CEDIS_CHEDRAUI"]
+                )
+            except ValueError:
+                # La tarjeta de salud ya marca el encabezado inválido; no
+                # impedimos que la interfaz muestre ese diagnóstico.
+                chedraui_origins = ()
     finally:
         workbook.close()
         if formula_workbook is not None:
@@ -1440,6 +1493,7 @@ def inspect_database(
         "error_count": len(rows) - healthy_count,
         "rows": rows,
         "manifest": manifest,
+        "chedraui_origins": chedraui_origins,
     }
     if not include_locations:
         return health
@@ -2184,6 +2238,7 @@ def load_database_resource() -> dict[str, Any]:
             "health": health,
             "city_labels": city_labels,
             "store_labels": store_labels,
+            "chedraui_origins": tuple(health.get("chedraui_origins", ())),
             "error": "",
         }
     except Exception as exc:
@@ -2193,6 +2248,7 @@ def load_database_resource() -> dict[str, Any]:
             "health": None,
             "city_labels": {},
             "store_labels": {},
+            "chedraui_origins": (),
             "error": str(exc),
         }
 
@@ -7138,6 +7194,7 @@ def execute_planning(
     special_doh_targets: dict[str, float] | None = None,
     solidus_swa_priority: bool = True,
     prioritize_chedraui_origins: bool = False,
+    chedraui_origins: Iterable[int] | None = None,
     include_naked_engine: bool = True,
     include_otacon_engine: bool = True,
     cover_fountain9_hardcodes: bool = True,
@@ -7186,7 +7243,20 @@ def execute_planning(
     venom_manual_skus_by_origin: dict[int, set[int]] | None = None,
     venom_only_manual_skus: bool = False,
 ) -> dict[str, Any]:
-    origins = effective_origin_order(origins, prioritize_chedraui_origins)
+    # La interfaz pasa esta lista desde el recurso cacheado de la base. El
+    # fallback sólo existe para llamadas directas de pruebas o integraciones.
+    if chedraui_origins is None:
+        chedraui_origins = configured_chedraui_origins(database_bytes)
+    else:
+        chedraui_origins = tuple(dict.fromkeys(int(origin) for origin in chedraui_origins))
+    origins = effective_origin_order(
+        origins,
+        prioritize_chedraui_origins,
+        chedraui_origins,
+    )
+    prioritized_chedraui_origins = tuple(
+        origin for origin in origins if origin in set(chedraui_origins)
+    )
     # El resultado anterior puede contener cientos de miles de diccionarios y
     # permanecer en session_state mientras se construye la siguiente corrida.
     # Liberarlo antes de abrir el XLSX evita que dos planeaciones convivan en
@@ -7259,10 +7329,16 @@ def execute_planning(
             config,
             copernico_csv_path=copernico_paths,
         )
-        if prioritize_chedraui_origins:
+        if prioritize_chedraui_origins and prioritized_chedraui_origins:
             catalogs.warnings.append(
                 "Prioridad Chedraui activa: todos los engines consumen primero "
-                "831 y 834; los demás orígenes conservan el orden de CODEC."
+                + ", ".join(map(str, prioritized_chedraui_origins))
+                + "; los demás orígenes conservan el orden de CODEC."
+            )
+        elif prioritize_chedraui_origins:
+            catalogs.warnings.append(
+                "Prioridad Chedraui activa, pero ningún origen seleccionado en "
+                "CODEC aparece en CEDIS_CHEDRAUI. Se conservó el orden de CODEC."
             )
         catalogs.origin_storage_override_enabled = bool(
             apply_origin_storage_override
@@ -11740,6 +11816,7 @@ def render() -> None:
     database_health = database_state["health"]
     city_labels = database_state["city_labels"]
     store_labels = database_state["store_labels"]
+    chedraui_origins = database_state["chedraui_origins"]
     database_error = database_state["error"]
 
     if database_health is not None:
@@ -11898,17 +11975,19 @@ def render() -> None:
                 ),
             )
             prioritize_chedraui_origins = st.toggle(
-                "Priorizar inventario Chedraui (831 / 834)",
+                "Priorizar inventario Chedraui",
                 value=False,
                 help=(
-                    "Fuerza 831 y 834 al inicio para todos los engines, incluso "
-                    "si no se seleccionaron arriba. Después se respetan los demás "
-                    "orígenes en el orden de CODEC y todas sus restricciones."
+                    "Adelanta para todos los engines sólo los orígenes incluidos "
+                    "en CEDIS_CHEDRAUI que también seleccionaste arriba. No agrega "
+                    "orígenes que no estén en CODEC. Después se respetan los demás "
+                    "orígenes, sus restricciones y su orden relativo."
                 ),
             )
             planning_origins = effective_origin_order(
                 selected_origins,
                 prioritize_chedraui_origins,
+                chedraui_origins,
             )
             if prioritize_chedraui_origins:
                 st.caption(
@@ -12299,7 +12378,7 @@ def render() -> None:
             with avl_left:
                 include_avl_fill = st.toggle(
                     "Cubrir quiebres del catálogo (AVL)",
-                    value=False,
+                    value=True,
                     help=(
                         "Busca productos del catálogo con stock final cero y utiliza "
                         "exclusivamente tareas sobrantes."
@@ -12308,7 +12387,7 @@ def render() -> None:
             with preventive_mid:
                 include_preventive_fill = st.toggle(
                     "Blindar posibles quiebres del catálogo",
-                    value=False,
+                    value=True,
                     help=(
                         "Busca inventarios positivos menores a 1 DOH o a 3 unidades, "
                         "sin recomendación positiva de Fountain9."
@@ -12317,7 +12396,7 @@ def render() -> None:
             with no_f9_right:
                 include_no_fountain9_coverage = st.toggle(
                     "Cubrir quiebres sin recomendación positiva de Fountain9",
-                    value=False,
+                    value=True,
                     help=(
                         "Corre al final de Solidus, con lo que sobró después de "
                         "AVL/Preventivo/Refuerzo. Cubre SKUs de catálogo con stock "
@@ -12357,7 +12436,7 @@ def render() -> None:
                 with column:
                     bucket_on = st.toggle(
                         toggle_label,
-                        value=False,
+                        value=True,
                         key=f"mb_special_{bucket.lower()}_on",
                         help=(
                             f"Sube el DOH de los {plural} que estén por debajo de su "
@@ -13144,6 +13223,7 @@ def render() -> None:
                     special_doh_targets=special_doh_targets,
                     solidus_swa_priority=solidus_swa_priority,
                     prioritize_chedraui_origins=prioritize_chedraui_origins,
+                    chedraui_origins=chedraui_origins,
                     include_naked_engine=include_naked_engine,
                     include_otacon_engine=include_otacon_engine,
                     shalashaska_extra_cities=tuple(shalashaska_extra_cities),
