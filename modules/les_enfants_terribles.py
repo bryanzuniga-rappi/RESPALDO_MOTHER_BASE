@@ -11883,8 +11883,12 @@ def render() -> None:
             """
             - `Bodega`: warehouse al que pertenece el inventario.
             - `EAN`: identificador interno del producto (`PRODUCT_ID`).
-            - `Ubicacion`: ubicación física utilizada para determinar si el saldo es usable.
+            - `Ubicacion`: ubicación física. Define si el saldo es usable en 444,
+              831 y cualquier bodega distinta de 856.
             - `Saldo`: unidades disponibles en esa ubicación.
+            - `ZonaPiso`: obligatoria **sólo si el archivo contiene Bodega 856**.
+              En 856 esta columna sustituye a `Ubicacion` para decidir usabilidad y
+              ambiente.
 
             Cada saldo no usable se descuenta únicamente de la combinación
             **Bodega + EAN** correspondiente. Por ejemplo, una fila con Bodega 856
@@ -11893,12 +11897,24 @@ def render() -> None:
             `DATA_TRANSFERS` ya no participa en el cálculo. Si no cargas ningún
             archivo, no se aplicará ningún descuento por ubicaciones no pickeables.
 
-            **Reglas especiales para Bodega 856 usando `ZonaPiso`:**
+            **Qué columna manda para decidir el inventario usable:**
 
-            - `E`: inventario usable y `STORAGE_TYPE = Room Temperature`.
+            - **Bodegas distintas de 856:** manda `Ubicacion`. Es usable si empieza
+              con `Z`, si empieza con `RECIBO_` o si tiene al menos 8 caracteres;
+              `CANCELADOS` se descuenta.
+            - **Bodega 856:** manda exclusivamente `ZonaPiso`; el valor de
+              `Ubicacion` no determina si el saldo se puede planear.
+            - **Cualquier bodega:** `ZonaPiso = LOST` siempre se descuenta.
+
+            **Reglas de Bodega 856 usando `ZonaPiso`:**
+
+            - `D` (actual) y `E` (histórico): inventario usable y
+              `STORAGE_TYPE = Room Temperature`.
             - `RCC`: inventario usable y `STORAGE_TYPE = Freezer`.
             - `RR`: inventario usable y `STORAGE_TYPE = Refrigerated`.
-            - `BIN`, `DIF` y `RC`: inventario no usable; su saldo se descuenta.
+            - Cualquier otro valor —incluidos `BIN`, `DIF`, `RC`, vacío o una zona
+              desconocida— es inventario no usable y su saldo se descuenta como
+              `ZONA_856`.
             - `MRM`: se ignora porque ya está descontado en el stock de la base.
 
             El override derivado de COPÉRNICO 856 se aplica automáticamente y
@@ -12123,7 +12139,9 @@ def render() -> None:
                 value=True,
                 help=(
                     "Si se apaga, el bloqueo CDMX→GDL/MTY de la hoja "
-                    "BLOQUEOS_FORANEAS deja de aplicarse."
+                    "BLOQUEOS_FORANEAS deja de aplicarse. No afecta las "
+                    "restricciones duras de CEDIS locales: 425 sólo atiende "
+                    "Guadalajara y 856 sólo Monterrey/Saltillo."
                 ),
             )
         with rules_col4:
@@ -12302,7 +12320,7 @@ def render() -> None:
             naked_left, naked_right = st.columns(2)
             with naked_left:
                 raise_small_roq_to_minimum = st.toggle(
-                    "Subir recomendaciones pequeñas al mínimo",
+                    "Elevar recomendaciones al mínimo de envío",
                     value=True,
                     help=(
                         "Una recomendación positiva de Fountain9 menor al mínimo "
@@ -12312,7 +12330,7 @@ def render() -> None:
                 )
             with naked_right:
                 use_extra_mov_columns = st.toggle(
-                    "Usar columnas adicionales de MOV",
+                    "Considerar columnas adicionales de MOV",
                     value=True,
                     help=(
                         "El MOV efectivo es el máximo entre la columna MOV y las "
@@ -12321,7 +12339,7 @@ def render() -> None:
                     ),
                 )
             cover_fountain9_hardcodes = st.toggle(
-                "Cubrir a Fountain9",
+                "Generar cobertura sin recomendación de Fountain9",
                 value=True,
                 help=(
                     "Cuando Fountain9 no dio un ROQ positivo (MOV ≤ 0), el "
@@ -12335,7 +12353,7 @@ def render() -> None:
                 rule_left, rule_center, rule_right = st.columns(3)
                 with rule_left:
                     hardcode_zero_total = st.toggle(
-                        "Cubrir forecast y stock en cero",
+                        "Cubrir con demanda e inventario inicial en cero",
                         value=True,
                         help=(
                             "Regla HARDCODE_4_CERO_TOTAL: demanda y opening "
@@ -12344,7 +12362,7 @@ def render() -> None:
                     )
                 with rule_center:
                     hardcode_inventory_below_demand = st.toggle(
-                        "Cubrir inventario menor a la demanda",
+                        "Cubrir cuando el inventario sea menor que la demanda",
                         value=True,
                         help=(
                             "Regla HARDCODE_3_INVENTARIO_MENOR_DEMANDA: ROQ no "
@@ -12353,7 +12371,7 @@ def render() -> None:
                     )
                 with rule_right:
                     hardcode_low_net_transfer = st.toggle(
-                        "Cubrir net transfer bajo",
+                        "Cubrir ante bajo net transfer e inventario limitado",
                         value=True,
                         help=(
                             "Regla HARDCODE_3_NET_TRANSFER_BAJO: ROQ no positivo, "
@@ -12365,25 +12383,25 @@ def render() -> None:
                     with net_left:
                         net_transfer_max = float(
                             st.number_input(
-                                "Net transfer máximo (unidades)",
+                                "Umbral máximo de net transfer (unidades)",
                                 min_value=0.0,
                                 max_value=50.0,
                                 value=float(origin_defaults["net_transfer_max"]),
                                 step=1.0,
                                 key="mb_net_transfer_max",
-                                help="La regla aplica con net transfer menor o igual a este valor.",
+                                help="La regla aplica cuando el net transfer es menor o igual a este umbral.",
                             )
                         )
                     with net_right:
                         destination_stock_below = float(
                             st.number_input(
-                                "Stock destino menor a (unidades)",
+                                "Umbral de inventario en destino (unidades)",
                                 min_value=0.0,
                                 max_value=50.0,
                                 value=float(origin_defaults["destination_stock_below"]),
                                 step=1.0,
                                 key="mb_destination_stock_below",
-                                help="La regla aplica con stock en destino estrictamente menor a este valor.",
+                                help="La regla aplica cuando el inventario en destino es estrictamente menor a este umbral.",
                             )
                         )
     
